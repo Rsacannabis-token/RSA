@@ -5,9 +5,11 @@ import (
 
 	proto "github.com/alethio/eth2stats-proto"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 
 	"github.com/alethio/eth2stats-client/beacon"
+	metricsWatcher "github.com/alethio/eth2stats-client/watcher/metrics"
 )
 
 var log = logrus.WithField("module", "core")
@@ -18,18 +20,24 @@ type Eth2statsConfig struct {
 	NodeName   string
 }
 
+type BeaconNodeConfig struct {
+	Type        string
+	Addr        string
+	MetricsAddr string
+}
+
 type Config struct {
-	Eth2stats      Eth2statsConfig
-	BeaconNodeType string
-	BeaconNodeAddr string
-	DataFolder     string
+	Eth2stats  Eth2statsConfig
+	BeaconNode BeaconNodeConfig
+	DataFolder string
 }
 
 type Core struct {
 	config Config
 
-	stats        proto.Eth2StatsClient
-	beaconClient beacon.Client
+	stats          proto.Eth2StatsClient
+	beaconClient   beacon.Client
+	metricsWatcher *metricsWatcher.Watcher
 
 	token string
 
@@ -47,9 +55,16 @@ func New(config Config) *Core {
 	c := Core{
 		config:       config,
 		stats:        initEth2statsClient(config.Eth2stats),
-		beaconClient: initBeaconClient(config.BeaconNodeType, config.BeaconNodeAddr),
+		beaconClient: initBeaconClient(config.BeaconNode.Type, config.BeaconNode.Addr),
 		restartChan:  make(chan bool),
 		stopChan:     make(chan bool),
+	}
+
+	if config.BeaconNode.MetricsAddr != "" {
+		c.metricsWatcher = metricsWatcher.New(metricsWatcher.Config{
+			MetricsURL: config.BeaconNode.MetricsAddr,
+		})
+		go c.metricsWatcher.Run()
 	}
 
 	err := c.searchToken()
@@ -89,6 +104,25 @@ func (c *Core) connectToServer() {
 
 	c.updateToken(resp.Token)
 
+	log.Info("getting chain head for initial feed")
+	head, err := c.beaconClient.GetChainHead()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.WithField("headSlot", head.HeadSlot).Info("got chain head")
+
+	_, err = c.stats.ChainHead(c.contextWithToken(), &proto.ChainHeadRequest{
+		HeadSlot:           head.HeadSlot,
+		HeadBlockRoot:      head.HeadBlockRoot,
+		FinalizedSlot:      head.FinalizedSlot,
+		FinalizedBlockRoot: head.FinalizedBlockRoot,
+		JustifiedSlot:      head.JustifiedSlot,
+		JustifiedBlockRoot: head.JustifiedBlockRoot,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	log.Info("successfully connected to eth2stats server")
 }
 
@@ -100,17 +134,23 @@ func (c *Core) watchNewHeads() {
 			log.Fatal(err)
 		}
 
+		limiter := rate.NewLimiter(1, 1)
+
 		for msg := range sub.Channel() {
-			_, err := c.stats.ChainHead(c.contextWithToken(), &proto.ChainHeadRequest{
-				HeadSlot:           msg.HeadSlot,
-				HeadBlockRoot:      msg.HeadBlockRoot,
-				FinalizedSlot:      msg.FinalizedSlot,
-				FinalizedBlockRoot: msg.FinalizedBlockRoot,
-				JustifiedSlot:      msg.JustifiedSlot,
-				JustifiedBlockRoot: msg.JustifiedBlockRoot,
-			})
-			if err != nil {
-				log.Fatal(err)
+			if limiter.Allow() {
+				_, err := c.stats.ChainHead(c.contextWithToken(), &proto.ChainHeadRequest{
+					HeadSlot:           msg.HeadSlot,
+					HeadBlockRoot:      msg.HeadBlockRoot,
+					FinalizedSlot:      msg.FinalizedSlot,
+					FinalizedBlockRoot: msg.FinalizedBlockRoot,
+					JustifiedSlot:      msg.JustifiedSlot,
+					JustifiedBlockRoot: msg.JustifiedBlockRoot,
+				})
+				if err != nil {
+					log.Fatal(err)
+				}
+			} else {
+				log.Warn("ChainHead request was skipped due to rate limiting")
 			}
 		}
 
@@ -133,38 +173,20 @@ func (c *Core) sendHeartbeat() {
 }
 
 func (c *Core) sendTelemetry() {
+	t := Telemetry{beaconClient: c.beaconClient, metricsWatcher: c.metricsWatcher}
+
 	for {
 		log.Trace("sending telemetry")
 
-		peers, err := c.beaconClient.GetPeerCount()
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Tracef("peers: %d", peers)
-
-		attestations, err := c.beaconClient.GetAttestationsInPoolCount()
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Tracef("attestations: %d", attestations)
-
-		syncing, err := c.beaconClient.GetSyncStatus()
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Tracef("node syncing: %t", syncing)
-
-		_, err = c.stats.Telemetry(c.contextWithToken(), &proto.TelemetryRequest{
-			Peers:              peers,
-			AttestationsInPool: attestations,
-			Syncing:            syncing,
-		})
+		_, err := c.stats.Telemetry(c.contextWithToken(), t.BuildRequest())
 		if err != nil {
 			log.Fatal(err)
 
 			continue
 		}
+
 		log.Trace("done sending telemetry")
+
 		time.Sleep(TelemetryInterval)
 	}
 }
