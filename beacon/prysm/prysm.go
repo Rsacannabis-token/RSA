@@ -3,6 +3,7 @@ package prysm
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 
 	"github.com/golang/protobuf/ptypes/empty"
 	prysmAPI "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
@@ -14,57 +15,60 @@ import (
 )
 
 var log = logrus.WithField("module", "prysm")
+var ClientMaxReceiveMessageSize = 67108864
 
 type Config struct {
 	GRPCAddr string
 }
 
-type BeaconClient struct {
+type PrysmGRPCClient struct {
 	config Config
 
 	beacon prysmAPI.BeaconChainClient
 	node   prysmAPI.NodeClient
 }
 
-func New(config Config) *BeaconClient {
+func New(config Config) *PrysmGRPCClient {
 	log.Info("setting up beacon client connection")
 
-	conn, err := grpc.Dial(config.GRPCAddr, grpc.WithInsecure())
+	conn, err := grpc.Dial(
+		config.GRPCAddr,
+		grpc.WithInsecure(),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(ClientMaxReceiveMessageSize)),
+	)
 	if err != nil {
-		log.Fatalf("fail to dial: %v", err)
+		log.Fatalf("failed to connect to prysm: %v", err)
 	}
 
 	beaconAPI := prysmAPI.NewBeaconChainClient(conn)
 	nodeAPI := prysmAPI.NewNodeClient(conn)
 
-	return &BeaconClient{
+	return &PrysmGRPCClient{
 		config: config,
 		beacon: beaconAPI,
 		node:   nodeAPI,
 	}
 }
 
-func (c *BeaconClient) GetVersion() (string, error) {
+func (c *PrysmGRPCClient) GetVersion() (string, error) {
 	version, err := c.node.GetVersion(context.Background(), &empty.Empty{})
 	if err != nil {
-		log.Error(err)
-		return "", err
+		return "", fmt.Errorf("prysm: getting version: %s", err)
 	}
 
 	return version.GetVersion(), nil
 }
 
-func (c *BeaconClient) GetGenesisTime() (int64, error) {
+func (c *PrysmGRPCClient) GetGenesisTime() (int64, error) {
 	genesis, err := c.node.GetGenesis(context.Background(), &empty.Empty{})
 	if err != nil {
-		log.Error(err)
-		return 0, err
+		return 0, fmt.Errorf("prysm: getting genesis time: %s", err)
 	}
 
 	return genesis.GetGenesisTime().GetSeconds(), nil
 }
 
-func (c *BeaconClient) GetPeerCount() (int64, error) {
+func (c *PrysmGRPCClient) GetPeerCount() (int64, error) {
 	peers, err := c.node.ListPeers(context.Background(), &empty.Empty{})
 	if err != nil {
 		log.Error(err)
@@ -74,17 +78,26 @@ func (c *BeaconClient) GetPeerCount() (int64, error) {
 	return int64(len(peers.Peers)), nil
 }
 
-func (c *BeaconClient) GetAttestationsInPoolCount() (int64, error) {
-	attestations, err := c.beacon.AttestationPool(context.Background(), &empty.Empty{})
+func (c *PrysmGRPCClient) GetAttestationsInPoolCount() (int64, error) {
+	req := &prysmAPI.AttestationPoolRequest{
+		PageSize: 1,
+	}
+	resp, err := c.beacon.AttestationPool(context.Background(), req)
 	if err != nil {
 		log.Error(err)
 		return 0, err
 	}
-
-	return int64(len(attestations.Attestations)), nil
+	if resp == nil {
+		return 0, beacon.NotImplemented
+	}
+	// fallback for not updated nodes
+	if resp.TotalSize == 0 && len(resp.Attestations) > 0 {
+		return int64(len(resp.Attestations)), nil
+	}
+	return int64(resp.TotalSize), nil
 }
 
-func (c *BeaconClient) GetSyncStatus() (bool, error) {
+func (c *PrysmGRPCClient) GetSyncStatus() (bool, error) {
 	sync, err := c.node.GetSyncStatus(context.Background(), &empty.Empty{})
 	if err != nil {
 		log.Error(err)
@@ -94,11 +107,10 @@ func (c *BeaconClient) GetSyncStatus() (bool, error) {
 	return sync.GetSyncing(), nil
 }
 
-func (c *BeaconClient) GetChainHead() (*types.ChainHead, error) {
+func (c *PrysmGRPCClient) GetChainHead() (*types.ChainHead, error) {
 	head, err := c.beacon.GetChainHead(context.Background(), &empty.Empty{})
 	if err != nil {
-		log.Error(err)
-		return nil, err
+		return nil, fmt.Errorf("prysm: getting chain head: %s", err)
 	}
 
 	return &types.ChainHead{
@@ -111,7 +123,7 @@ func (c *BeaconClient) GetChainHead() (*types.ChainHead, error) {
 	}, nil
 }
 
-func (c *BeaconClient) SubscribeChainHeads() (beacon.ChainHeadSubscription, error) {
+func (c *PrysmGRPCClient) SubscribeChainHeads() (beacon.ChainHeadSubscription, error) {
 	stream, err := c.beacon.StreamChainHead(context.Background(), &empty.Empty{})
 	if err != nil {
 		log.Error(err)
